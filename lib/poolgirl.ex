@@ -100,14 +100,15 @@ defmodule Poolgirl do
 
   #############################################
   #
-  # FUNCTION: init / caller side
+  # FUNCTION: init
   #
   #############################################
   def init({pool_args, worker_args}) do
     Process.flag(:trap_exit, :true)
     waiting = :queue.new()
     monitors = :ets.new(:monitors, [:private])
-    init(pool_args, worker_args, %PoolState{waiting: waiting, monitors: monitors})
+    workers_to_reap = :ets.new(:workers_to_reap, [:private])
+    init(pool_args, worker_args, %PoolState{waiting: waiting, monitors: monitors, workers_to_reap: workers_to_reap})
   end
   def init([{:worker_module, mod} | rest], worker_args, state) when is_atom(mod) do
     {:ok, sup} = PoolgirlSupervisor.start_link(mod, worker_args)
@@ -121,6 +122,9 @@ defmodule Poolgirl do
   end
   def init([{:strategy, :lifo} | rest], worker_args, state), do: init(rest, worker_args, %PoolState{ state | strategy: :lifo})
   def init([{:strategy, :fifo} | rest], worker_args, state), do: init(rest, worker_args, %PoolState{ state | strategy: :fifo})
+  def init([{:overflow_ttl, overflow_ttl} | rest], worker_args, state) when is_integer(overflow_ttl) do
+    init(rest, worker_args, %PoolState{state | overflow_ttl: overflow_ttl})
+  end
   def init([_M | rest], worker_args, state), do: init(rest, worker_args, state)
   def init([], _worker_args, %PoolState{size: size, supervisor: sup} = state) do
     workers = prepopulate(size, sup)
@@ -194,11 +198,17 @@ defmodule Poolgirl do
                 workers:      workers,
                 monitors:     monitors,
                 overflow:     overflow,
+                overflow_ttl: overflow_ttl,
                 max_overflow: max_overflow } = state
     case workers do
-        [ pid | left] ->
+        [ pid | left ] when  overflow_ttl > 0 ->
             mRef = Process.monitor(from_pid)
-            :true = :ets.insert(state.monitors, {pid, cRef, mRef})
+            :true = :ets.insert(monitors, {pid, cRef, mRef})
+            :ok = cancel_worker_reap(state, pid)
+            {:reply, pid, %PoolState{ state | workers: left}}
+        [ pid | left ] ->
+            mRef = Process.monitor(from_pid)
+            :true = :ets.insert(monitors, {pid, cRef, mRef})
             {:reply, pid, %PoolState{ state | workers: left}}
         [] when max_overflow > 0 and overflow < max_overflow ->
             {pid, mRef} = new_worker(sup, from_pid)
@@ -219,8 +229,9 @@ defmodule Poolgirl do
   #############################################
   def handle_call(:status, _from, state) do
     %PoolState{ workers: workers, monitors: monitors, overflow: overflow } = state
+    checked_out_workers = :ets.info(monitors, :size)
     statename = state_name(state)
-    {:reply, {statename, length(workers), overflow, :ets.info(monitors, :size)}, state}
+    {:reply, {statename, length(workers), overflow, checked_out_workers}, state}
   end
   #############################################
   #
@@ -289,7 +300,8 @@ defmodule Poolgirl do
   #
   #############################################
   def handle_info({:"EXIT", pid, _reason}, state) do
-    %PoolState{supervisor: sup, monitors: monitors} = state
+    %PoolState{supervisor: sup, monitors: monitors, workers: workers} = state
+    :ok = cancel_worker_reap(state, pid)
     case :ets.lookup(monitors, pid) do
         [{pid, _, mRef}] ->
             :true = Process.demonitor(mRef)
@@ -297,16 +309,34 @@ defmodule Poolgirl do
             newstate = handle_worker_exit(pid, state)
             {:noreply, newstate}
         [] ->
-            case Enum.member?(state.workers, pid) do
+            case Enum.member?(workers, pid) do
                 :true ->
-                    w = Enum.filter(state.workers, fn (x) -> x != pid end)
+                    w = Enum.filter(workers, fn (x) -> x != pid end)
                     {:noreply, %PoolState{workers: [ new_worker(sup) | w ]}};
                 :false ->
                     {:noreply, state}
             end
     end
   end
-
+  #############################################
+  #
+  # MESSAGE: {:reap_worker, pid}
+  #
+  #############################################
+  def handle_info({:reap_worker, pid}, state) do
+    %PoolState{monitors: monitors, workers_to_reap: workers_to_reap} = state
+    :true = :ets.delete(workers_to_reap, pid)
+    case :ets.lookup(monitors, pid) do
+      [{pid, _, mRef}] ->
+        :true = :erlang.demonitor(mRef)
+        :true = :ets.delete(monitors, pid)
+        newstate = purge_worker(pid, state)
+        {:noreply, newstate}
+      [] ->
+        newstate = purge_worker(pid, state)
+        {:noreply, newstate}
+    end
+  end
   #############################################
   #
   # Unhandled generic message
@@ -355,27 +385,67 @@ defmodule Poolgirl do
     Supervisor.terminate_child(sup, pid)
   end
 
+  defp cancel_worker_reap(state, pid) do
+    case :ets.lookup(state.workers_to_reap, pid) do
+        [{pid, tRef}] ->
+          :erlang.cancel_timer(tRef)
+          :true = :ets.delete(state.workers_to_reap, pid)
+          :ok
+        [] ->
+          :ok
+    end
+  end
+
+  defp purge_worker(pid, state) do
+    %PoolState{supervisor: sup, workers: workers, overflow: overflow} = state
+    case overflow > 0 do
+      :true ->
+        w = Enum.filter(workers, fn (p) -> p != pid end)
+        :ok = dismiss_worker(sup, pid)
+        %PoolState{ state | workers: w, overflow: overflow - 1}
+      :false ->
+        state
+    end
+  end
+
   defp prepopulate(n, _sup) when n < 1, do: []
   defp prepopulate(n, sup), do: prepopulate(n, sup, [])
   defp prepopulate(0, _sup, workers), do: workers
   defp prepopulate(n, sup, workers), do: prepopulate(n-1, sup, [ new_worker(sup) | workers])
 
+
+  defp handle_pool_increase([], waiting, state), do: %PoolState{state | waiting: waiting }
+  defp handle_pool_increase(workers, [], state), do: %PoolState{state | workers: [ workers | state.workers ]}
+  defp handle_pool_increase([first_worker | workers], [first_wait | waiting], state) do
+
+  end
+
+
   defp handle_checkin(pid, state) do
-    %PoolState{ supervisor: sup, waiting: waiting, monitors: monitors, overflow: overflow, strategy: strategy } = state
+    %PoolState{ supervisor: sup, waiting: waiting, monitors: monitors, overflow: overflow,
+                strategy: strategy, overflow_ttl: overflow_ttl, workers_to_reap: workers_to_reap } = state
     case :queue.out(waiting) do
         {{:value, {from, cRef, mRef}}, left} ->
-            :true = :ets.insert(monitors, {pid, cRef, mRef})
-            GenServer.reply(from, pid)
-            %PoolState{ state | waiting: left}
+          :true = :ets.insert(monitors, {pid, cRef, mRef})
+          GenServer.reply(from, pid)
+          %PoolState{ state | waiting: left}
+        {:empty, empty} when overflow > 0 and overflow_ttl > 0 ->
+          tRef = :erlang.send_after(overflow_ttl, self, {:reap_worker, pid})
+          :true = :ets.insert(workers_to_reap, {pid, tRef})
+          workers = case strategy do
+                      :lifo -> [ pid | state.workers ]
+                      :fifo -> [ state.workers | pid ]
+                    end
+          %PoolState{ state | workers: workers, waiting: empty}
         {:empty, empty} when overflow > 0 ->
-            :ok = dismiss_worker(sup, pid)
-            %PoolState{ state | waiting: empty, overflow: overflow - 1}
+          :ok = dismiss_worker(sup, pid)
+          %PoolState{ state | waiting: empty, overflow: overflow - 1}
         {:empty, empty} ->
-            workers = case strategy do
-                :lifo -> [ pid | state.workers]
-                :fifo -> state.workers ++ [ pid ]
-            end
-            %PoolState{state | workers: workers, waiting: empty, overflow: 0}
+          workers = case strategy do
+              :lifo -> [ pid | state.workers]
+              :fifo -> state.workers ++ [ pid ]
+          end
+          %PoolState{state | workers: workers, waiting: empty, overflow: 0}
     end
   end
 
@@ -403,7 +473,15 @@ defmodule Poolgirl do
         :false -> :ready
     end
   end
-  defp state_name(%PoolState{overflow: max_overflow, max_overflow: max_overflow}), do: :full
+  defp state_name(state = %PoolState{ overflow: overflow }) when overflow > 0 do
+    %PoolState{ max_overflow: max_overflow, workers: workers, overflow: overflow } = state
+    number_of_workers = length(workers)
+    case max_overflow == overflow do
+      :true when number_of_workers > 0 -> :ready
+      :true -> :full
+      :false -> :overflow
+    end
+  end
   defp state_name(_state), do: :overflow
 
 end

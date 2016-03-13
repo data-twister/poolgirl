@@ -439,6 +439,60 @@ test "Checks that the the pool handles the empty condition correctly when overfl
     assert res == :ok
   end
 
+  test "pool overflow ttl workers" do
+    {:ok, pid} = new_pool_with_overflow_ttl(1, 1, 1000)
+    worker = Poolgirl.checkout(pid)
+    worker1 = Poolgirl.checkout(pid)
+    # Test pool behaves normally when full
+    assert {:full, 0, 1, 2} == Poolgirl.status(pid)
+    assert :full == Poolgirl.checkout(pid, :false)
+    # Test first worker is returned to list of available workers
+    Poolgirl.checkin(pid, worker)
+    :timer.sleep(500)
+    assert {:ready, 1, 1, 1} == Poolgirl.status(pid)
+    # Ensure first worker is in fact being reused
+    worker2 = Poolgirl.checkout(pid)
+    assert {:full, 0, 1, 2} == Poolgirl.status(pid)
+    assert worker == worker2
+    # Test second worker is returned to list of available workers
+    Poolgirl.checkin(pid, worker1)
+    :timer.sleep(500)
+    assert {:ready, 1, 1, 1} == Poolgirl.status(pid)
+    # Ensure second worker is in fact being reused
+    worker3 =  Poolgirl.checkout(pid)
+    assert {:full, 0, 1, 2} == Poolgirl.status(pid)
+    assert worker1 == worker3
+    # Test we've got two workers ready when two are checked in in quick
+    # succession
+    Poolgirl.checkin(pid, worker2)
+    :timer.sleep(100)
+    assert {:ready, 1, 1, 1} == Poolgirl.status(pid)
+    Poolgirl.checkin(pid, worker3)
+    :timer.sleep(100)
+    assert {:ready, 2, 1, 0} == Poolgirl.status(pid)
+    # Test an owner death
+    spawn(fn() ->
+               Poolgirl.checkout(pid)
+               receive do after 100 -> exit(:normal) end
+           end)
+    assert {:ready, 2, 1, 0} == Poolgirl.status(pid)
+    assert 2 == length(pool_call(pid, :get_all_workers))
+    # Test overflow worker is reaped in the correct time period
+    :timer.sleep(850)
+    # Test overflow worker is reaped in the correct time period
+    assert {:ready, 1, 0, 0} == Poolgirl.status(pid)
+    # Test worker death behaviour
+    worker4 = Poolgirl.checkout(pid)
+    worker5 = Poolgirl.checkout(pid)
+    Process.exit(worker5, :kill)
+    :timer.sleep(100)
+    assert {:overflow, 0, 0, 1} == Poolgirl.status(pid)
+    Process.exit(worker4, :kill)
+    :timer.sleep(100)
+    assert {:ready, 1, 0, 0} == Poolgirl.status(pid)
+    :ok = pool_call(pid, :stop)
+  end
+
   defp get_monitors(pid) do
     # Synchronise with the Pid to ensure it has handled all expected work.
     _ = :sys.get_status(pid)
@@ -455,10 +509,13 @@ test "Checks that the the pool handles the empty condition correctly when overfl
   end
 
   defp new_pool(size, max_overflow, strategy) do
-    Poolgirl.start_link([{:name, {:local, :poolgirl_test}},
-                        {:worker_module, PoolgirlTestWorker},
-                        {:size, size}, {:max_overflow, max_overflow},
+    Poolgirl.start_link([{:name, {:local, :poolgirl_test}}, {:worker_module, PoolgirlTestWorker}, {:size, size}, {:max_overflow, max_overflow},
                         {:strategy, strategy}])
+  end
+
+  defp new_pool_with_overflow_ttl(size, max_overflow, overflow_ttl) do
+    Poolgirl.start_link([{:name, {:local, :poolgirl_test}}, {:worker_module, PoolgirlTestWorker}, {:size, size}, {:max_overflow, max_overflow},
+                         {:overflow_ttl, overflow_ttl}])
   end
 
   defp checkin_worker(pid, worker) do
