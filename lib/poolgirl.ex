@@ -85,6 +85,13 @@ defmodule Poolgirl do
   def start(pool_args), do: start(pool_args, pool_args)
   def start(pool_args, worker_args), do: start_pool(:start, pool_args, worker_args)
 
+  #############################################
+  #
+  # FUNCTION: change_size
+  #
+  #############################################
+  def change_size(pool, new_size) when is_integer(new_size), do: GenServer.call(pool, {:new_size, new_size})
+
   ######################################################################################################################
   #
   #                                                  GENSERVER API
@@ -231,7 +238,9 @@ defmodule Poolgirl do
     %PoolState{ workers: workers, monitors: monitors, overflow: overflow } = state
     checked_out_workers = :ets.info(monitors, :size)
     statename = state_name(state)
-    {:reply, {statename, length(workers), overflow, checked_out_workers}, state}
+    {:reply, {statename, {:available_workers, length(workers)},
+                         {:overflow_workers, overflow},
+                         {:checked_out_workers, checked_out_workers}}, state}
   end
   #############################################
   #
@@ -264,6 +273,22 @@ defmodule Poolgirl do
   #
   #############################################
   def handle_call(:stop, _from, state), do: {:stop, :normal, :ok, state}
+  #############################################
+  #
+  # MESSAGE: {:new_size, new_size}
+  #
+  #############################################
+  def handle_call({:new_size, new_size}, _from, %PoolState{size: new_size } = state) do
+    {:reply, :ok, state}
+  end
+  def handle_call({:new_size, new_size}, _from, %PoolState{size: old_size} = state) when new_size > old_size do
+    newstate = handle_size_increase(new_size - old_size, state)
+    {:reply, :ok, %PoolState{newstate | size: new_size} }
+  end
+  def handle_call({:new_size, new_size}, _from, %PoolState{size: old_size } = state) when new_size < old_size and new_size >= 0 do
+    newstate = handle_size_decrease(old_size - new_size, state)
+    {:reply, :ok, %PoolState{newstate | size: new_size}}
+  end
   #############################################
   #
   # Unhandled call messages
@@ -303,19 +328,19 @@ defmodule Poolgirl do
     %PoolState{supervisor: sup, monitors: monitors, workers: workers} = state
     :ok = cancel_worker_reap(state, pid)
     case :ets.lookup(monitors, pid) do
-        [{pid, _, mRef}] ->
-            :true = Process.demonitor(mRef)
-            :true = :ets.delete(monitors, pid)
-            newstate = handle_worker_exit(pid, state)
-            {:noreply, newstate}
-        [] ->
-            case Enum.member?(workers, pid) do
-                :true ->
-                    w = Enum.filter(workers, fn (x) -> x != pid end)
-                    {:noreply, %PoolState{workers: [ new_worker(sup) | w ]}};
-                :false ->
-                    {:noreply, state}
-            end
+      [{pid, _, mRef}] ->
+        :true = Process.demonitor(mRef)
+        :true = :ets.delete(monitors, pid)
+        newstate = handle_worker_exit(pid, state)
+        {:noreply, newstate}
+      [] ->
+        case Enum.member?(workers, pid) do
+          :true ->
+            w = Enum.filter(workers, fn (x) -> x != pid end)
+            {:noreply, %PoolState{workers: [ new_worker(sup) | w ]}};
+          :false ->
+            {:noreply, state}
+        end
     end
   end
   #############################################
@@ -368,6 +393,121 @@ defmodule Poolgirl do
     end
   end
 
+  defp handle_size_decrease(0, state), do: %PoolState{ state | to_be_removed: 0}
+  defp handle_size_decrease(delta, state) do
+    %PoolState{ supervisor:   sup,
+                workers:      workers,
+                overflow:     overflow,
+                overflow_ttl: overflow_ttl,
+                max_overflow: max_overflow } = state
+    case workers do
+      # We look for workers that have no ttl. We set a ttl for those
+      [ _ | _ ] when  overflow_ttl > 0 and overflow < max_overflow ->
+        response = increase_overflow_workers(workers, state)
+        case response do
+          {:ko, new_state} ->
+            # All workers have a ttl set and we are below max_overflow. We should be good normally.
+            new_state
+          {:ok, new_state} ->
+            # We found a worker that had no ttl. We set a ttl for it, increased overflow, decreased delta
+            handle_size_decrease(delta - 1, new_state)
+        end
+      [pid | tail] when  overflow_ttl > 0 and overflow == max_overflow ->
+        # We are at max_overflow. We should dismiss some workers immediately.
+        # First, we should dismiss workers that have a ttl. Otherwise, we take the risk to dismiss too much workers
+        response = dismiss_workers_with_ttl(workers, state)
+        case response do
+          {:ko, _ } ->
+            # No workers have a ttl set. Normally, this use case should not happen (only when overflow = max_overflow = 0)
+            :ok = cancel_worker_reap(state, pid) # normally, this call is useless
+            :ok = dismiss_worker(sup, pid)
+            handle_size_decrease(delta - 1, %PoolState{state | workers: tail })
+          {:ok, new_state} ->
+            # We found a worker that had a ttl. we dismissed it immediately and we decreased overflow
+            handle_size_decrease(delta - 1, new_state)
+        end
+      [ pid | tail ] ->
+        :ok = dismiss_worker(sup, pid)
+        handle_size_decrease(delta - 1, %PoolState{ state | workers: tail})
+      [] when overflow < max_overflow ->
+        handle_size_decrease(delta - 1, %PoolState{state | overflow: overflow + 1})
+      [] ->
+        %PoolState{state | to_be_removed: delta}
+    end
+  end
+
+  defp handle_size_increase(0, state), do: state
+  defp handle_size_increase(delta, state) do
+    %PoolState{supervisor: supervisor, workers:  workers,  waiting:  waiting,  workers_to_reap: workers_to_reap,
+               monitors:   monitors,   overflow: overflow, strategy: strategy, overflow_ttl: overflow_ttl, to_be_removed: to_be_removed } = state
+    if to_be_removed > 0 do
+      handle_size_increase(delta - 1, %PoolState{state | to_be_removed: to_be_removed - 1})
+    else
+      # We should not destroy workers if it is not needed because it could be expensive to reallocate them
+      # So we first check if they are already allocated workers.
+      case :queue.out(waiting) do
+        # We have pending tasks and we have some allocated workers that wait to be used
+        {{:value, {from, cRef, mRef}}, left} when overflow > 0 and overflow_ttl > 0 ->
+          [[pid, tRef] | _ ] = :ets.match(workers_to_reap,{:"$1",:"$2"})
+          cancel_worker_reap(pid, state)
+          :true = :ets.insert(monitors, {pid, cRef, mRef})
+          GenServer.reply(from, pid)
+          handle_size_increase(delta - 1, %PoolState{ state | waiting: left, overflow: overflow - 1})
+        # We have exhausted allocated workers and we have still some pending tasks
+        {{:value, {from, cRef, mRef}}, left} ->
+          pid = new_worker(supervisor)
+          :true = :ets.insert(monitors, {pid, cRef, mRef})
+          GenServer.reply(from, pid)
+          handle_size_increase(delta - 1, %PoolState{ state | waiting: left})
+        # We have exhausted pending tasks
+        {:empty, empty} when overflow > 0 and overflow_ttl > 0 ->
+          case :ets.match(workers_to_reap,{:"$1",:"$2"}) do
+            [[pid, tRef] | _ ] ->
+              # We have allocated workers that wait to be used
+              :erlang.cancel_timer(tRef)
+              :true = :ets.delete(workers_to_reap, pid)
+              new_workers = case strategy do
+                :lifo -> [ pid | workers]
+                :fifo -> workers ++ [ pid ]
+              end
+              handle_size_increase(delta - 1, %PoolState{ state | waiting: empty, overflow: overflow - 1, workers: new_workers})
+            [] ->
+              # Overflow workers are busy working. Decrease number of overflow workers
+              handle_size_increase(delta - 1, %PoolState{ state | waiting: empty, overflow: overflow - 1})
+          end
+        # We are in overflow state. So we reduce this overflow number.
+        {:empty, _} when overflow > 0 ->
+          handle_size_increase(delta - 1, %PoolState{ state | overflow: overflow - 1})
+        # We have nothing to do except allocating new workers.
+        {:empty, _} ->
+          extra_workers = prepopulate(delta, supervisor)
+          handle_size_increase(0, %PoolState{ state | workers: workers ++ extra_workers })
+      end
+    end
+  end
+
+  defp dismiss_workers_with_ttl([], state), do: {:ko, state}
+  defp dismiss_workers_with_ttl([pid | tail], %PoolState{supervisor: sup, overflow: overflow, workers_to_reap: workers_to_reap} = state) do
+    if :ets.member(workers_to_reap, pid) do
+      :ok = cancel_worker_reap(state, pid)
+      :ok = dismiss_worker(sup, pid)
+      {:ok, %PoolState{state | workers: tail, overflow: overflow - 1}}
+    else
+      dismiss_workers_with_ttl(tail, state)
+    end
+  end
+
+  defp increase_overflow_workers([], state), do: {:ko, %PoolState{state | to_be_removed: 0}}
+  defp increase_overflow_workers([pid | tail], %PoolState{overflow_ttl: overflow_ttl, overflow: overflow, workers_to_reap: workers_to_reap} = state )  do
+    if :ets.member(workers_to_reap, pid) do
+      increase_overflow_workers(tail, state)
+    else
+      tRef = :erlang.send_after(overflow_ttl, self, {:reap_worker, pid})
+      :true = :ets.insert(workers_to_reap, {pid, tRef})
+      {:ok, %PoolState{ state | workers: tail ++ pid, overflow: overflow + 1}}
+    end
+  end
+
   defp new_worker(sup) do
     {:ok, pid} = Supervisor.start_child(sup, [])
     :true = Process.link(pid)
@@ -376,7 +516,7 @@ defmodule Poolgirl do
 
   defp new_worker(sup, from_pid) do
     pid = new_worker(sup)
-    ref = Process.monitor( from_pid)
+    ref = Process.monitor(from_pid)
     {pid, ref}
   end
 
@@ -413,55 +553,56 @@ defmodule Poolgirl do
   defp prepopulate(0, _sup, workers), do: workers
   defp prepopulate(n, sup, workers), do: prepopulate(n-1, sup, [ new_worker(sup) | workers])
 
-
-  defp handle_pool_increase([], waiting, state), do: %PoolState{state | waiting: waiting }
-  defp handle_pool_increase(workers, [], state), do: %PoolState{state | workers: [ workers | state.workers ]}
-  defp handle_pool_increase([first_worker | workers], [first_wait | waiting], state) do
-
-  end
-
-
   defp handle_checkin(pid, state) do
-    %PoolState{ supervisor: sup, waiting: waiting, monitors: monitors, overflow: overflow,
+    %PoolState{ supervisor: sup,    waiting: waiting, monitors: monitors, overflow: overflow, to_be_removed: to_be_removed,
                 strategy: strategy, overflow_ttl: overflow_ttl, workers_to_reap: workers_to_reap } = state
-    case :queue.out(waiting) do
-        {{:value, {from, cRef, mRef}}, left} ->
-          :true = :ets.insert(monitors, {pid, cRef, mRef})
-          GenServer.reply(from, pid)
-          %PoolState{ state | waiting: left}
-        {:empty, empty} when overflow > 0 and overflow_ttl > 0 ->
-          tRef = :erlang.send_after(overflow_ttl, self, {:reap_worker, pid})
-          :true = :ets.insert(workers_to_reap, {pid, tRef})
-          workers = case strategy do
-                      :lifo -> [ pid | state.workers ]
-                      :fifo -> [ state.workers | pid ]
-                    end
-          %PoolState{ state | workers: workers, waiting: empty}
-        {:empty, empty} when overflow > 0 ->
+    if to_be_removed > 0 do
           :ok = dismiss_worker(sup, pid)
-          %PoolState{ state | waiting: empty, overflow: overflow - 1}
-        {:empty, empty} ->
-          workers = case strategy do
-              :lifo -> [ pid | state.workers]
-              :fifo -> state.workers ++ [ pid ]
-          end
-          %PoolState{state | workers: workers, waiting: empty, overflow: 0}
+          %PoolState{ state | to_be_removed: to_be_removed - 1}
+    else
+      case :queue.out(waiting) do
+          {{:value, {from, cRef, mRef}}, left} ->
+            :true = :ets.insert(monitors, {pid, cRef, mRef})
+            GenServer.reply(from, pid)
+            %PoolState{ state | waiting: left}
+          {:empty, empty} when overflow > 0 and overflow_ttl > 0 ->
+            tRef = :erlang.send_after(overflow_ttl, self, {:reap_worker, pid})
+            :true = :ets.insert(workers_to_reap, {pid, tRef})
+            workers = case strategy do
+                        :lifo -> [ pid | state.workers ]
+                        :fifo -> [ state.workers | pid ]
+                      end
+            %PoolState{ state | workers: workers, waiting: empty}
+          {:empty, empty} when overflow > 0 ->
+            :ok = dismiss_worker(sup, pid)
+            %PoolState{ state | waiting: empty, overflow: overflow - 1}
+          {:empty, empty} ->
+            workers = case strategy do
+                :lifo -> [ pid | state.workers]
+                :fifo -> state.workers ++ [ pid ]
+            end
+            %PoolState{state | workers: workers, waiting: empty, overflow: 0}
+      end
     end
   end
 
   defp handle_worker_exit(pid, state) do
-    %PoolState{supervisor: sup, monitors: monitors, overflow: overflow} = state
-    case :queue.out(state.waiting) do
+    %PoolState{supervisor: sup, monitors: monitors, overflow: overflow, to_be_removed: to_be_removed} = state
+    if to_be_removed > 0 do
+          %PoolState{ state | to_be_removed: to_be_removed - 1}
+    else
+      case :queue.out(state.waiting) do
         {{:value, {from, cRef, mRef}}, left_waiting} ->
-            newworker = new_worker(state.supervisor)
-            :true = :ets.insert(monitors, {newworker, cRef, mRef})
-            GenServer.reply(from, newworker)
-            %PoolState{ state | waiting: left_waiting}
+          new_worker = new_worker(state.supervisor)
+          :true = :ets.insert(monitors, {new_worker, cRef, mRef})
+          GenServer.reply(from, new_worker)
+          %PoolState{ state | waiting: left_waiting}
         {:empty, empty} when overflow > 0 ->
-           %PoolState{ state | overflow: overflow - 1, waiting: empty}
+          %PoolState{ state | overflow: overflow - 1, waiting: empty}
         {:empty, empty} ->
-            workers = [ new_worker(sup) | Enum.filter(state.workers, fn (x) -> x != pid end)]
-            %PoolState{ state | workers: workers, waiting: empty}
+          workers = [ new_worker(sup) | Enum.filter(state.workers, fn (x) -> x != pid end)]
+          %PoolState{ state | workers: workers, waiting: empty}
+      end
     end
   end
 

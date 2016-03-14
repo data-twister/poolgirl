@@ -280,7 +280,7 @@ test "Checks that the the pool handles the empty condition correctly when overfl
     assert :full == Poolgirl.checkout(pid, :false)
     a = hd(workers)
     checkin_worker(pid, a)
-    newworker = Poolgirl.checkout(pid, false)
+    newworker = Poolgirl.checkout(pid, :false)
     assert false == Process.alive?(a) # Overflow workers get shutdown
     assert is_pid(newworker)
     assert :full == Poolgirl.checkout(pid, :false)
@@ -321,31 +321,31 @@ test "Checks that the the pool handles the empty condition correctly when overfl
 
   test "pool returns status" do
     {:ok, pool} = new_pool(2, 0)
-    assert {:ready, 2, 0, 0} == Poolgirl.status(pool)
+    assert {:ready, {:available_workers, 2}, {:overflow_workers, 0}, {:checked_out_workers, 0}} == Poolgirl.status(pool)
     Poolgirl.checkout(pool)
-    assert {:ready, 1, 0, 1} == Poolgirl.status(pool)
+    assert {:ready, {:available_workers, 1}, {:overflow_workers, 0}, {:checked_out_workers, 1}} == Poolgirl.status(pool)
     Poolgirl.checkout(pool)
-    assert {:full, 0, 0, 2} == Poolgirl.status(pool)
+    assert {:full, {:available_workers, 0}, {:overflow_workers, 0}, {:checked_out_workers, 2}} == Poolgirl.status(pool)
     :ok = pool_call(pool, :stop)
 
     {:ok, pool2} = new_pool(1, 1)
-    assert {:ready, 1, 0, 0} == Poolgirl.status(pool2)
+    assert {:ready, {:available_workers, 1}, {:overflow_workers, 0}, {:checked_out_workers, 0}} == Poolgirl.status(pool2)
     Poolgirl.checkout(pool2)
-    assert {:overflow, 0, 0, 1} == Poolgirl.status(pool2)
+    assert {:overflow, {:available_workers, 0}, {:overflow_workers, 0}, {:checked_out_workers, 1}} == Poolgirl.status(pool2)
     Poolgirl.checkout(pool2)
-    assert {:full, 0, 1, 2} == Poolgirl.status(pool2)
+    assert {:full, {:available_workers, 0}, {:overflow_workers, 1}, {:checked_out_workers, 2}} == Poolgirl.status(pool2)
    :ok = pool_call(pool2, :stop)
 
     {:ok, pool3} = new_pool(0, 2)
-    assert {:overflow, 0, 0, 0} ==  Poolgirl.status(pool3)
+    assert {:overflow, {:available_workers, 0}, {:overflow_workers, 0}, {:checked_out_workers, 0}} ==  Poolgirl.status(pool3)
     Poolgirl.checkout(pool3)
-    assert {:overflow, 0, 1, 1} == Poolgirl.status(pool3)
+    assert {:overflow, {:available_workers, 0}, {:overflow_workers, 1}, {:checked_out_workers, 1}} == Poolgirl.status(pool3)
     Poolgirl.checkout(pool3)
-    assert {:full, 0, 2, 2} == Poolgirl.status(pool3)
+    assert {:full, {:available_workers, 0}, {:overflow_workers, 2}, {:checked_out_workers, 2}} == Poolgirl.status(pool3)
    :ok = pool_call(pool3, :stop)
 
     {:ok, pool4} = new_pool(0, 0)
-    assert {:full, 0, 0, 0} == Poolgirl.status(pool4)
+    assert {:full, {:available_workers, 0}, {:overflow_workers, 0}, {:checked_out_workers, 0}} == Poolgirl.status(pool4)
    :ok = pool_call(pool4, :stop)
   end
 
@@ -375,7 +375,7 @@ test "Checks that the the pool handles the empty condition correctly when overfl
     {:ok, pid} = new_pool(2, 0)
     worker1 = Poolgirl.checkout(pid)
     :ok = Poolgirl.checkin(pid, worker1)
-    worker1 = Poolgirl.checkout(pid)
+    Poolgirl.checkout(pid)
     Poolgirl.stop(pid)
   end
 
@@ -383,7 +383,7 @@ test "Checks that the the pool handles the empty condition correctly when overfl
     {:ok, pid} = new_pool(2, 0, :lifo)
     worker1 = Poolgirl.checkout(pid)
     :ok = Poolgirl.checkin(pid, worker1)
-    worker1 = Poolgirl.checkout(pid)
+    Poolgirl.checkout(pid)
     Poolgirl.stop(pid)
   end
 
@@ -393,7 +393,7 @@ test "Checks that the the pool handles the empty condition correctly when overfl
     :ok = Poolgirl.checkin(pid, worker1)
     worker2 = Poolgirl.checkout(pid)
     assert worker1 != worker2
-    worker1 = Poolgirl.checkout(pid)
+    Poolgirl.checkout(pid)
     Poolgirl.stop(pid)
   end
 
@@ -416,7 +416,7 @@ test "Checks that the the pool handles the empty condition correctly when overfl
     ref = Process.monitor(worker)
     Process.exit(worker, :kill)
     receive do
-        {:"DOWN", ref, _, _, _} ->
+        {:"DOWN", ^ref, _, _, _} ->
             :ok
     end
 
@@ -428,11 +428,11 @@ test "Checks that the the pool handles the empty condition correctly when overfl
 
   test "test checkout with timeout" do
     {:ok, pid} = new_pool(5, 0)
-    workers = Enum.to_list 0..4 |> Enum.map(fn _ -> Poolgirl.checkout(pid) end)
+    _workers = Enum.to_list 0..4 |> Enum.map(fn _ -> Poolgirl.checkout(pid) end)
     assert 0 == length(pool_call(pid, :get_avail_workers))
     assert 5 == length(pool_call(pid, :get_all_workers))
     res = try do
-      res = Poolgirl.checkout(pid)
+      Poolgirl.checkout(pid)
     catch
       :exit, {:timeout, _} -> :ok
     end
@@ -444,53 +444,210 @@ test "Checks that the the pool handles the empty condition correctly when overfl
     worker = Poolgirl.checkout(pid)
     worker1 = Poolgirl.checkout(pid)
     # Test pool behaves normally when full
-    assert {:full, 0, 1, 2} == Poolgirl.status(pid)
+    assert {:full, {:available_workers, 0}, {:overflow_workers, 1}, {:checked_out_workers, 2}} == Poolgirl.status(pid)
     assert :full == Poolgirl.checkout(pid, :false)
     # Test first worker is returned to list of available workers
     Poolgirl.checkin(pid, worker)
     :timer.sleep(500)
-    assert {:ready, 1, 1, 1} == Poolgirl.status(pid)
+    assert {:ready, {:available_workers, 1}, {:overflow_workers, 1}, {:checked_out_workers, 1}} == Poolgirl.status(pid)
     # Ensure first worker is in fact being reused
     worker2 = Poolgirl.checkout(pid)
-    assert {:full, 0, 1, 2} == Poolgirl.status(pid)
+    assert {:full, {:available_workers, 0}, {:overflow_workers, 1}, {:checked_out_workers, 2}} == Poolgirl.status(pid)
     assert worker == worker2
     # Test second worker is returned to list of available workers
     Poolgirl.checkin(pid, worker1)
     :timer.sleep(500)
-    assert {:ready, 1, 1, 1} == Poolgirl.status(pid)
+    assert {:ready, {:available_workers, 1}, {:overflow_workers, 1}, {:checked_out_workers, 1}} == Poolgirl.status(pid)
     # Ensure second worker is in fact being reused
     worker3 =  Poolgirl.checkout(pid)
-    assert {:full, 0, 1, 2} == Poolgirl.status(pid)
+    assert {:full, {:available_workers, 0}, {:overflow_workers, 1}, {:checked_out_workers, 2}} == Poolgirl.status(pid)
     assert worker1 == worker3
     # Test we've got two workers ready when two are checked in in quick
     # succession
     Poolgirl.checkin(pid, worker2)
     :timer.sleep(100)
-    assert {:ready, 1, 1, 1} == Poolgirl.status(pid)
+    assert {:ready, {:available_workers, 1}, {:overflow_workers, 1}, {:checked_out_workers, 1}} == Poolgirl.status(pid)
     Poolgirl.checkin(pid, worker3)
     :timer.sleep(100)
-    assert {:ready, 2, 1, 0} == Poolgirl.status(pid)
+    assert {:ready, {:available_workers, 2}, {:overflow_workers, 1}, {:checked_out_workers, 0}} == Poolgirl.status(pid)
     # Test an owner death
     spawn(fn() ->
                Poolgirl.checkout(pid)
                receive do after 100 -> exit(:normal) end
            end)
-    assert {:ready, 2, 1, 0} == Poolgirl.status(pid)
+    assert {:ready, {:available_workers, 2}, {:overflow_workers, 1}, {:checked_out_workers, 0}} == Poolgirl.status(pid)
     assert 2 == length(pool_call(pid, :get_all_workers))
     # Test overflow worker is reaped in the correct time period
     :timer.sleep(850)
     # Test overflow worker is reaped in the correct time period
-    assert {:ready, 1, 0, 0} == Poolgirl.status(pid)
+    assert {:ready, {:available_workers, 1}, {:overflow_workers, 0}, {:checked_out_workers, 0}} == Poolgirl.status(pid)
     # Test worker death behaviour
     worker4 = Poolgirl.checkout(pid)
     worker5 = Poolgirl.checkout(pid)
     Process.exit(worker5, :kill)
     :timer.sleep(100)
-    assert {:overflow, 0, 0, 1} == Poolgirl.status(pid)
+    assert {:overflow, {:available_workers, 0}, {:overflow_workers, 0}, {:checked_out_workers, 1}} == Poolgirl.status(pid)
     Process.exit(worker4, :kill)
     :timer.sleep(100)
-    assert {:ready, 1, 0, 0} == Poolgirl.status(pid)
+    assert {:ready, {:available_workers, 1}, {:overflow_workers, 0}, {:checked_out_workers, 0}} == Poolgirl.status(pid)
     :ok = pool_call(pid, :stop)
+  end
+
+  test "basic pool increase" do
+    {:ok, pool} = new_pool(1, 0)
+    Poolgirl.change_size(pool, 2)
+    assert {:ready, {:available_workers, 2}, {:overflow_workers, 0}, {:checked_out_workers, 0}} == Poolgirl.status(pool)
+  end
+  test "Increase when in full state" do
+    {:ok, pool} = new_pool(2, 0)
+    _workers = Enum.to_list 0..1 |> Enum.map(fn _ -> Poolgirl.checkout(pool) end)
+    assert {:full, {:available_workers, 0}, {:overflow_workers, 0}, {:checked_out_workers, 2}} == Poolgirl.status(pool)
+    Poolgirl.change_size(pool, 3)
+    assert {:ready, {:available_workers, 1}, {:overflow_workers, 0}, {:checked_out_workers, 2}} == Poolgirl.status(pool)
+  end
+  test "Increase in overflow state" do
+    {:ok, pool} = new_pool(2, 2)
+    Enum.to_list 0..2 |> Enum.map(fn _ -> Poolgirl.checkout(pool) end)
+    assert {:overflow, {:available_workers, 0}, {:overflow_workers, 1}, {:checked_out_workers, 3}} == Poolgirl.status(pool)
+    Poolgirl.change_size(pool, 3)
+    assert {:overflow, {:available_workers, 0}, {:overflow_workers, 0}, {:checked_out_workers, 3}} == Poolgirl.status(pool)
+    Enum.to_list 0..1 |> Enum.map(fn _ -> Poolgirl.checkout(pool) end)
+    assert {:full, {:available_workers, 0}, {:overflow_workers, 2}, {:checked_out_workers, 5}} == Poolgirl.status(pool)
+  end
+  test "Increase with ttl to dismiss worker" do
+    {:ok, pool} = new_pool_with_overflow_ttl(3, 2, 1000)
+    _workers = Enum.to_list 0..4 |> Enum.map(fn _ -> Poolgirl.checkout(pool) end)
+    assert {:full, {:available_workers, 0}, {:overflow_workers, 2}, {:checked_out_workers, 5}} == Poolgirl.status(pool)
+    Poolgirl.change_size(pool, 4)
+    assert {:overflow, {:available_workers, 0}, {:overflow_workers, 1}, {:checked_out_workers, 5}} == Poolgirl.status(pool)
+    pid = Poolgirl.checkout(pool)
+    assert {:full, {:available_workers, 0}, {:overflow_workers, 2}, {:checked_out_workers, 6}} == Poolgirl.status(pool)
+    checkin_worker(pool, pid)
+    Poolgirl.change_size(pool, 5)
+    :timer.sleep(1000)
+    workers = pool_call(pool, :get_all_workers)
+    assert :true = Enum.member?(workers, {:undefined, pid, :worker, [PoolgirlTest.PoolgirlTestWorker]})
+  end
+
+  test "pool decrease" do
+    {:ok, pool} = new_pool(3, 0)
+    Poolgirl.change_size(pool, 2)
+    assert {:ready, {:available_workers, 2}, {:overflow_workers, 0}, {:checked_out_workers, 0}} == Poolgirl.status(pool)
+  end
+
+  test "pool decrease with overflow without ttl" do
+    {:ok, pool} = new_pool(2, 1)
+    [pid | workers] = Enum.to_list 1..3 |> Enum.map(fn _ -> Poolgirl.checkout(pool) end)
+    # We have 3 workers busy - 2 normal, 1 overflow
+    Poolgirl.change_size(pool, 1)
+    # We have 3 workers busy - 3 checked out worker then - 1 normal, 1 overflow, 1 to be removed
+    assert {:full, {:available_workers, 0}, {:overflow_workers, 1}, {:checked_out_workers, 3}} == Poolgirl.status(pool)
+    checkin_worker(pool, pid)
+    # We have 2 workers busy - 2 checked out worker then - 1 normal, 1 overflow
+    assert {:full, {:available_workers, 0}, {:overflow_workers, 1}, {:checked_out_workers, 2}} == Poolgirl.status(pool)
+    [ pid | _workers ] = workers
+    checkin_worker(pool, pid)
+    # We have 1 workers busy - 1 checked out worker then - 1 normal, 0 overflow
+    assert {:overflow, {:available_workers, 0}, {:overflow_workers, 0}, {:checked_out_workers, 1}} == Poolgirl.status(pool)
+    _pid = Poolgirl.checkout(pool)
+    # We have 2 workers busy - 2 checked out worker then - 1 normal, 1 overflow
+    assert {:full, {:available_workers, 0}, {:overflow_workers, 1}, {:checked_out_workers, 2}} == Poolgirl.status(pool)
+  end
+
+  test "pool decrease with available overflow workers" do
+    {:ok, pool} = new_pool(5, 2)
+    [pid1, pid2 | _workers] = Enum.to_list 1..5 |> Enum.map(fn _ -> Poolgirl.checkout(pool) end)
+    # We have 5 workers busy - 5 checked out worker then - 5 normal, 0 overflow
+    assert {:overflow, {:available_workers, 0}, {:overflow_workers, 0}, {:checked_out_workers, 5}} == Poolgirl.status(pool)
+    Poolgirl.change_size(pool, 3)
+    # We have 5 workers busy - 5 checked out worker then - 3 normal, 2 overflow
+    assert {:full, {:available_workers, 0}, {:overflow_workers, 2}, {:checked_out_workers, 5}} == Poolgirl.status(pool)
+    checkin_worker(pool, pid1)
+    # We have 4 workers busy - 4 checked out worker then - 3 normal, 1 overflow
+    assert {:overflow, {:available_workers, 0}, {:overflow_workers, 1}, {:checked_out_workers, 4}} == Poolgirl.status(pool)
+    pid3 = Poolgirl.checkout(pool)
+    # We have 4 workers busy - 5 checked out worker then - 3 normal, 2 overflow
+    assert {:full, {:available_workers, 0}, {:overflow_workers, 2}, {:checked_out_workers, 5}} == Poolgirl.status(pool)
+    Poolgirl.change_size(pool, 1)
+    # We have 4 workers busy - 5 checked out worker then: 1 normal, 2 overflow, 2 to be removed
+    checkin_worker(pool, pid2)
+    checkin_worker(pool, pid3)
+    # We have 3 workers busy - 3 checked out worker then: 1 normal, 2 overflow
+    assert {:full, {:available_workers, 0}, {:overflow_workers, 2}, {:checked_out_workers, 3}} == Poolgirl.status(pool)
+    Poolgirl.change_size(pool, 4)
+    # We have 3 workers busy - 3 checked out worker then: 3 normal, 1 available
+    assert {:ready, {:available_workers, 1}, {:overflow_workers, 0}, {:checked_out_workers, 3}} == Poolgirl.status(pool)
+    Poolgirl.change_size(pool, 3)
+    # We have 3 workers busy - 3 checked out worker then: 3 normal, 0 available
+    assert {:overflow, {:available_workers, 0}, {:overflow_workers, 0}, {:checked_out_workers, 3}} == Poolgirl.status(pool)
+    Poolgirl.change_size(pool, 2)
+    # We have 3 workers busy - 3 checked out worker then: 2 normal, 1 overflow
+    assert {:overflow, {:available_workers, 0}, {:overflow_workers, 1}, {:checked_out_workers, 3}} == Poolgirl.status(pool)
+    Poolgirl.change_size(pool, 1)
+    # We have 3 workers busy - 3 checked out worker then: 1 normal, 2 overflow, 0 to be removed
+    assert {:full, {:available_workers, 0}, {:overflow_workers, 2}, {:checked_out_workers, 3}} == Poolgirl.status(pool)
+    Poolgirl.change_size(pool, 0)
+    # We have 3 workers busy - 3 checked out worker then: 0 normal, 2 overflow, 1 to be removed
+    assert {:full, {:available_workers, 0}, {:overflow_workers, 2}, {:checked_out_workers, 3}} == Poolgirl.status(pool)
+    [{:undefined, pid1, :worker, [PoolgirlTest.PoolgirlTestWorker]}, _pid2, _pid3] = pool_call(pool, :get_all_workers)
+    kill_worker(pid1)
+    # We have 2 workers busy - 2 checked out worker then: 0 normal, 2 overflow
+    assert {:full, {:available_workers, 0}, {:overflow_workers, 2}, {:checked_out_workers, 2}} == Poolgirl.status(pool)
+    [{:undefined, pid2, :worker, [PoolgirlTest.PoolgirlTestWorker]}, {:undefined, pid3, :worker, [PoolgirlTest.PoolgirlTestWorker]}] = pool_call(pool, :get_all_workers)
+    kill_worker(pid2)
+    # We have 1 workers busy - 1 checked out worker then: 0 normal, 1 overflow
+    assert {:overflow, {:available_workers, 0}, {:overflow_workers, 1}, {:checked_out_workers, 1}} == Poolgirl.status(pool)
+    kill_worker(pid3)
+    # We have 1 workers busy - 0 checked out worker then: 0 normal, 0 overflow
+    assert {:overflow, {:available_workers, 0}, {:overflow_workers, 0}, {:checked_out_workers, 0}} == Poolgirl.status(pool)
+  end
+
+  test "pool decrease with overflow with ttl" do
+    {:ok, pool} = new_pool_with_overflow_ttl(5, 2, 1000)
+    [ pid1, pid2 | _workers] = Enum.to_list 1..5 |> Enum.map(fn _ -> Poolgirl.checkout(pool) end)
+    Poolgirl.change_size(pool, 3)
+    # Here two workers are in excess -> They are put with overflow workers and they expire after 1000 ms
+    checkin_worker(pool, pid1)
+    checkin_worker(pool, pid2)
+    :timer.sleep(1000)
+    assert {:overflow, {:available_workers, 0}, {:overflow_workers, 0}, {:checked_out_workers, 3}} == Poolgirl.status(pool)
+  end
+
+  test "pool decrease with overflow with ttl. Reuse of one of them" do
+    {:ok, pool} = new_pool_with_overflow_ttl(5, 2, 1000)
+    [pid1, pid2 | _workers] = Enum.to_list 1..5 |> Enum.map(fn _ -> Poolgirl.checkout(pool) end)
+    Poolgirl.change_size(pool, 3)
+    # Here two workers are in excess -> They are put with overflow workers
+    # We reuse on of them immediately and the other one expire after 1000 ms
+    checkin_worker(pool, pid1)
+    checkin_worker(pool, pid2)
+    _pid3 = Poolgirl.checkout(pool)
+    :timer.sleep(1000)
+    assert {:overflow, {:available_workers, 0}, {:overflow_workers, 1}, {:checked_out_workers, 4}} == Poolgirl.status(pool)
+  end
+  test "pool decrease with overflow with ttl. All are used" do
+    {:ok, pool} = new_pool_with_overflow_ttl(5, 2, 1000)
+    [pid1, pid2 | _workers] = Enum.to_list 1..7 |> Enum.map(fn _ -> Poolgirl.checkout(pool) end)
+    Poolgirl.change_size(pool, 3)
+    # Here two workers are in excess -> They are immediately dismissed when checked in.
+    checkin_worker(pool, pid1)
+    checkin_worker(pool, pid2)
+    pid3 = Poolgirl.checkout(pool, :false)
+    assert pid3 == :full
+    assert {:full, {:available_workers, 0}, {:overflow_workers, 2}, {:checked_out_workers, 5}} == Poolgirl.status(pool)
+  end
+
+  test "Take all workers, decrease size and then increase" do
+    {:ok, pool} = new_pool_with_overflow_ttl(5, 2, 1000)
+    [pid1, pid2 | _workers] = Enum.to_list 1..5 |> Enum.map(fn _ -> Poolgirl.checkout(pool) end)
+    Poolgirl.change_size(pool, 3)
+    # Here two workers are in excess -> They are in overflow workers.
+    Poolgirl.checkin(pid1, pool)
+    Poolgirl.checkin(pid2, pool)
+    # We come back in the initial state. Overflow workers come back in normal workers and are not dismissed
+    Poolgirl.change_size(pool, 5)
+    :timer.sleep(1000)
+    assert {:overflow, {:available_workers, 0}, {:overflow_workers, 0}, {:checked_out_workers, 5}} == Poolgirl.status(pool)
   end
 
   defp get_monitors(pid) do
@@ -514,7 +671,7 @@ test "Checks that the the pool handles the empty condition correctly when overfl
   end
 
   defp new_pool_with_overflow_ttl(size, max_overflow, overflow_ttl) do
-    Poolgirl.start_link([{:name, {:local, :poolgirl_test}}, {:worker_module, PoolgirlTestWorker}, {:size, size}, {:max_overflow, max_overflow},
+    Poolgirl.start_link([{:name, {:local, :poolgirl_test_ttl}}, {:worker_module, PoolgirlTestWorker}, {:size, size}, {:max_overflow, max_overflow},
                          {:overflow_ttl, overflow_ttl}])
   end
 

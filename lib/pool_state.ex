@@ -10,5 +10,6 @@ defmodule PoolState do
             overflow:        0,
             max_overflow:    10,
             strategy:        :lifo,
-            overflow_ttl:    0
+            overflow_ttl:    0,
+            to_be_removed:   0
 end
