@@ -5,6 +5,7 @@ defmodule Poolgirl do
   require Logger
 
   @timeout 5000
+  @msg_timeout 5000
 
   use GenServer
 
@@ -12,7 +13,13 @@ defmodule Poolgirl do
   #
   #                                                  API INTERFACES
   #
-  ######################################################################################################################
+  #############################################
+  #
+  # FUNCTION: async_broadcast_to_pool
+  #
+  #############################################
+  def async_broadcast_to_pool(pool, message), do: GenServer.call(pool, {:async_broadcast, message})
+  #############################################
   #
   # FUNCTION: checkout
   #
@@ -91,12 +98,18 @@ defmodule Poolgirl do
   #
   #############################################
   def change_size(pool, new_size) when is_integer(new_size), do: GenServer.call(pool, {:new_size, new_size})
+  #############################################
+  #
+  # FUNCTION: give_conf
+  #
+  #############################################
+  def give_conf(pool), do: GenServer.call(pool, :give_conf)
 
   ######################################################################################################################
   #
   #                                                  GENSERVER API
   #
-  ######################################################################################################################
+  #############################################
   #
   # FUNCTION: start_link / caller side
   #
@@ -132,6 +145,9 @@ defmodule Poolgirl do
   def init([{:overflow_ttl, overflow_ttl} | rest], worker_args, state) when is_integer(overflow_ttl) do
     init(rest, worker_args, %PoolState{state | overflow_ttl: overflow_ttl})
   end
+  def init([{:broadcast_to_workers, broadcast_to_workers} | rest], worker_args, state) when is_boolean(broadcast_to_workers) do
+    init(rest, worker_args, %PoolState{state | broadcast_to_workers: broadcast_to_workers})
+  end
   def init([_M | rest], worker_args, state), do: init(rest, worker_args, state)
   def init([], _worker_args, %PoolState{size: size, supervisor: sup} = state) do
     workers = prepopulate(size, sup)
@@ -142,7 +158,7 @@ defmodule Poolgirl do
   #
   #                                                  CAST MESSAGE FUNCTIONS
   #
-  ######################################################################################################################
+  #############################################
   #
   # MESSAGE: {:checkin, pid}
   #
@@ -195,7 +211,18 @@ defmodule Poolgirl do
   #
   #                                                  CALL MESSAGE FUNCTIONS
   #
-  ######################################################################################################################
+  #############################################
+  #
+  # MESSAGE: {:async_broadcast, message}
+  #
+  #############################################
+  def handle_call({:async_broadcast, message}, _from, %PoolState{broadcast_to_workers: :true} = state) do
+    state.supervisor |> Supervisor.which_children
+                     |> Enum.map(fn {_, pid, _, _} -> send pid, {:broadcast, message}  end)
+    {:reply, :ok, state}
+  end
+  def handle_call({:async_broadcast, _}, _from,  state), do: { :reply, {:ok, :no_broadcast}, state}
+  #############################################
   #
   # MESSAGE: {:checkout, cRef, block}
   #
@@ -288,6 +315,15 @@ defmodule Poolgirl do
   def handle_call({:new_size, new_size}, _from, %PoolState{size: old_size } = state) when new_size < old_size and new_size >= 0 do
     newstate = handle_size_decrease(old_size - new_size, state)
     {:reply, :ok, %PoolState{newstate | size: new_size}}
+  end
+  #############################################
+  #
+  # MESSAGE: :give_conf
+  #
+  #############################################
+  def handle_call(:give_conf, _from, %PoolState{ size: size, max_overflow: max_overflow, strategy: strategy,overflow_ttl: overflow_ttl, broadcast_to_workers: btw} = state) do
+    resp = %{ size: size, max_overflow: max_overflow, strategy: strategy,overflow_ttl: overflow_ttl, broadcast_to_workers: btw }
+    {:reply, resp, state}
   end
   #############################################
   #

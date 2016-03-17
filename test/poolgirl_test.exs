@@ -24,9 +24,11 @@ defmodule PoolgirlTest do
     def handle_call(_msg, _from, state) do
       {:reply, :ok, state}
     end
-
-
     def handle_cast(_msg, state) do
+      {:noreply, state}
+    end
+    def handle_info({:broadcast, msg}, state) do
+      Logger.debug "#{inspect msg}"
       {:noreply, state}
     end
   end
@@ -650,6 +652,19 @@ test "Checks that the the pool handles the empty condition correctly when overfl
     assert {:overflow, {:available_workers, 0}, {:overflow_workers, 0}, {:checked_out_workers, 5}} == Poolgirl.status(pool)
   end
 
+  test "broadcast to the pool with no broadcast configurated" do
+    {:ok, pool} = new_pool(5, 2)
+    Poolgirl.async_broadcast_to_pool(pool, {:test})
+    res = Poolgirl.async_broadcast_to_pool(pool, {:test})
+    assert res == {:ok, :no_broadcast}
+  end
+  test "broadcast to the pool" do
+    {:ok, pool} = new_pool_broadcast(5, 2, :true)
+    _workers = Enum.to_list 1..3 |> Enum.map(fn _ -> Poolgirl.checkout(pool) end)
+    res = Poolgirl.async_broadcast_to_pool(pool, {:test})
+    assert res == :ok
+  end
+
   defp get_monitors(pid) do
     # Synchronise with the Pid to ensure it has handled all expected work.
     _ = :sys.get_status(pid)
@@ -663,6 +678,13 @@ test "Checks that the the pool handles the empty condition correctly when overfl
 
   defp new_pool(size, max_overflow) do
     Poolgirl.start_link([{:name, {:local, :poolgirl_test}}, {:worker_module, PoolgirlTestWorker}, {:size, size}, {:max_overflow, max_overflow}])
+  end
+  defp new_pool_broadcast(size, max_overflow, broadcast) do
+    Poolgirl.start_link([{:name, {:local, :poolgirl_test}},
+                         {:worker_module, PoolgirlTestWorker},
+                         {:size, size},
+                         {:max_overflow, max_overflow},
+                         {:broadcast_to_workers, broadcast}])
   end
 
   defp new_pool(size, max_overflow, strategy) do
