@@ -9,21 +9,8 @@ defmodule Poolgirl do
 
   use GenServer
 
-  ######################################################################################################################
-  #
-  #                                                  API INTERFACES
-  #
-  #############################################
-  #
-  # FUNCTION: async_broadcast_to_pool
-  #
-  #############################################
   def async_broadcast_to_pool(pool, message), do: GenServer.call(pool, {:async_broadcast, message})
-  #############################################
-  #
-  # FUNCTION: checkout
-  #
-  #############################################
+
   def checkout(pool), do: checkout(pool, :true)
   def checkout(pool, block), do: checkout(pool, block, @timeout)
   def checkout(pool, block, timeout) do
@@ -36,32 +23,15 @@ defmodule Poolgirl do
             :erlang.raise(class, reason, :erlang.get_stacktrace())
     end
   end
-  #############################################
-  #
-  # FUNCTION: checkin
-  #
-  #############################################
+
   def checkin(pool, worker) when is_pid(worker), do: GenServer.cast(pool, {:checkin, worker})
 
-  #############################################
-  #
-  # FUNCTION: status
-  #
-  #############################################
+
   def status(pool), do: GenServer.call(pool, :status)
 
-  #############################################
-  #
-  # FUNCTION: stop
-  #
-  #############################################
-  def stop(pool), do: GenServer.call(pool, :stop)
 
-  #############################################
-  #
-  # FUNCTION: transaction
-  #
-  #############################################
+  def stop(pool), do: GenServer.call(pool, :stop)
+ 
   def transaction(pool, fun), do: transaction(pool, fun, @timeout)
   def transaction(pool, fun, timeout) do
     worker = checkout(pool, :true, timeout)
@@ -72,11 +42,6 @@ defmodule Poolgirl do
     end
   end
 
-  #############################################
-  #
-  # FUNCTION: child_spec
-  #
-  #############################################
   def child_spec(pool_id, pool_args) do
     child_spec(pool_id, pool_args, [])
   end
@@ -84,45 +49,20 @@ defmodule Poolgirl do
     Supervisor.Spec.worker(Poolgirl, [pool_args, worker_args], [id: pool_id])
   end
 
-  #############################################
-  #
-  # FUNCTION: start
-  #
-  #############################################
+ 
   def start(pool_args), do: start(pool_args, pool_args)
   def start(pool_args, worker_args), do: start_pool(:start, pool_args, worker_args)
 
-  #############################################
-  #
-  # FUNCTION: change_size
-  #
-  #############################################
   def change_size(pool, new_size) when is_integer(new_size), do: GenServer.call(pool, {:new_size, new_size})
-  #############################################
-  #
-  # FUNCTION: give_conf
-  #
-  #############################################
+
   def give_conf(pool), do: GenServer.call(pool, :give_conf)
 
-  ######################################################################################################################
-  #
-  #                                                  GENSERVER API
-  #
-  #############################################
-  #
-  # FUNCTION: start_link / caller side
-  #
-  #############################################
+
   def start_link(pool_args), do: start_link(pool_args, pool_args)
   def start_link(pool_args, worker_args), do:  start_pool(:start_link, pool_args, worker_args)
 
 
-  #############################################
-  #
-  # FUNCTION: init
-  #
-  #############################################
+ 
   def init({pool_args, worker_args}) do
     Process.flag(:trap_exit, :true)
     waiting = :queue.new()
@@ -154,15 +94,7 @@ defmodule Poolgirl do
     {:ok, %PoolState{ state | workers: workers}}
   end
 
-  ######################################################################################################################
-  #
-  #                                                  CAST MESSAGE FUNCTIONS
-  #
-  #############################################
-  #
-  # MESSAGE: {:checkin, pid}
-  #
-  #############################################
+
   def handle_cast({:checkin, pid}, state = %PoolState{monitors: monitors}) do
     case :ets.lookup(monitors, pid) do
         [{pid, _, mRef}] ->
@@ -175,11 +107,7 @@ defmodule Poolgirl do
     end
   end
 
-  #############################################
-  #
-  # MESSAGE: {:cancel_waiting, cRef}
-  #
-  #############################################
+
   def handle_cast({:cancel_waiting, cRef}, state) do
     case :ets.match(state.monitors, {:"$1", cRef, :"$2"}) do
         [[pid, mRef]] ->
@@ -198,35 +126,19 @@ defmodule Poolgirl do
             {:noreply, %PoolState{ state | waiting: waiting}}
     end
   end
-  #############################################
-  #
-  # Unhandled cast msg
-  #
-  #############################################
+
   def handle_cast(_msg, state) do
     {:noreply, state}
   end
 
-  ######################################################################################################################
-  #
-  #                                                  CALL MESSAGE FUNCTIONS
-  #
-  #############################################
-  #
-  # MESSAGE: {:async_broadcast, message}
-  #
-  #############################################
+
   def handle_call({:async_broadcast, message}, _from, %PoolState{broadcast_to_workers: :true} = state) do
     state.supervisor |> Supervisor.which_children
                      |> Enum.map(fn {_, pid, _, _} -> send pid, {:broadcast, message}  end)
     {:reply, :ok, state}
   end
   def handle_call({:async_broadcast, _}, _from,  state), do: { :reply, {:ok, :no_broadcast}, state}
-  #############################################
-  #
-  # MESSAGE: {:checkout, cRef, block}
-  #
-  #############################################
+
   def handle_call({:checkout, cRef, block}, {from_pid, _} = from, state) do
     %PoolState{ supervisor:   sup,
                 workers:      workers,
@@ -256,11 +168,7 @@ defmodule Poolgirl do
             {:noreply, %PoolState{ state | waiting: waiting}}
     end
   end
-  #############################################
-  #
-  # MESSAGE: :status
-  #
-  #############################################
+
   def handle_call(:status, _from, state) do
     %PoolState{ workers: workers, monitors: monitors, overflow: overflow } = state
     checked_out_workers = :ets.info(monitors, :size)
@@ -269,42 +177,22 @@ defmodule Poolgirl do
                          {:overflow_workers, overflow},
                          {:checked_out_workers, checked_out_workers}}, state}
   end
-  #############################################
-  #
-  # MESSAGE: :get_avail_workers
-  #
-  #############################################
+
   def handle_call(:get_avail_workers, _from, state), do: {:reply, state.workers, state}
-  #############################################
-  #
-  # MESSAGE: :get_all_workers
-  #
-  #############################################
+
   def handle_call(:get_all_workers, _from, state) do
     worker_list = state.supervisor
                   |> Supervisor.which_children
     {:reply, worker_list, state}
   end
-  #############################################
-  #
-  # MESSAGE: :get_all_monitors
-  #
-  #############################################
+
   def handle_call(:get_all_monitors, _from, state) do
     monitors = :ets.select(state.monitors, [{{:"$1", :"_", :"$2"}, [], [{{:"$1", :"$2"}}]}])
     {:reply, monitors, state}
   end
-  #############################################
-  #
-  # MESSAGE: :stop
-  #
-  #############################################
+
   def handle_call(:stop, _from, state), do: {:stop, :normal, :ok, state}
-  #############################################
-  #
-  # MESSAGE: {:new_size, new_size}
-  #
-  #############################################
+
   def handle_call({:new_size, new_size}, _from, %PoolState{size: new_size } = state) do
     {:reply, :ok, state}
   end
@@ -316,34 +204,18 @@ defmodule Poolgirl do
     newstate = handle_size_decrease(old_size - new_size, state)
     {:reply, :ok, %PoolState{newstate | size: new_size}}
   end
-  #############################################
-  #
-  # MESSAGE: :give_conf
-  #
-  #############################################
+
   def handle_call(:give_conf, _from, %PoolState{ size: size, max_overflow: max_overflow, strategy: strategy,overflow_ttl: overflow_ttl, broadcast_to_workers: btw} = state) do
     resp = %{ size: size, max_overflow: max_overflow, strategy: strategy,overflow_ttl: overflow_ttl, broadcast_to_workers: btw }
     {:reply, resp, state}
   end
-  #############################################
-  #
-  # Unhandled call messages
-  #
-  #############################################
+
   def handle_call(_msg, _from, state) do
     reply = {:error, :invalid_message}
     {:reply, reply, state}
   end
 
-  ######################################################################################################################
-  #
-  #                                                  GENERIC MESSAGE FUNCTIONS
-  #
-  ######################################################################################################################
-  #
-  # MESSAGE: :"DOWN"
-  #
-  #############################################
+
   def handle_info({:"DOWN", mRef, _, _, _}, state) do
     case :ets.match(state.monitors, {:"$1", :"_", mRef}) do
         [[pid]] ->
@@ -355,11 +227,7 @@ defmodule Poolgirl do
             {:noreply, %PoolState{ state | waiting: waiting}}
     end
   end
-  #############################################
-  #
-  # MESSAGE: :"EXIT"
-  #
-  #############################################
+
   def handle_info({:"EXIT", pid, _reason}, state) do
     %PoolState{supervisor: sup, monitors: monitors, workers: workers} = state
     :ok = cancel_worker_reap(state, pid)
@@ -379,11 +247,7 @@ defmodule Poolgirl do
         end
     end
   end
-  #############################################
-  #
-  # MESSAGE: {:reap_worker, pid}
-  #
-  #############################################
+ 
   def handle_info({:reap_worker, pid}, state) do
     %PoolState{monitors: monitors, workers_to_reap: workers_to_reap} = state
     :true = :ets.delete(workers_to_reap, pid)
@@ -398,11 +262,7 @@ defmodule Poolgirl do
         {:noreply, newstate}
     end
   end
-  #############################################
-  #
-  # Unhandled generic message
-  #
-  #############################################
+
   def handle_info(_Info, state) do
     {:noreply, state}
   end
@@ -415,11 +275,7 @@ defmodule Poolgirl do
 
   def code_change(_oldVsn, state, _extra), do: {:ok, state}
 
-  ######################################################################################################################
-  #
-  #                                                  HELPER FUNCTIONS
-  #
-  ######################################################################################################################
+
   defp start_pool(start_fun, pool_args, worker_args) do
     case :proplists.get_value(:name, pool_args) do
         :undefined ->
